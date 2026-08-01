@@ -1,4 +1,5 @@
 import io
+import json
 import math
 from dataclasses import dataclass
 from datetime import date
@@ -97,6 +98,117 @@ hr {border-color:var(--line) !important;}
 }
 </style>""", unsafe_allow_html=True)
 
+APP_DATA_VERSION = 1
+
+DEFAULT_EXPENSES = pd.DataFrame({"Expense":["Household","Education","Insurance & medical","Travel","Other"],"Monthly amount":[35000,5000,5000,3000,2000]})
+DEFAULT_ASSETS = pd.DataFrame({"Asset":["Bank / emergency fund","FD / debt","Equity / mutual funds","PF / NPS","Gold"],"Current value":[300000,100000,500000,400000,100000],"Use for own contribution %":[0,50,0,0,0],"Keep invested in wealth plan %":[0,0,100,0,0]})
+DEFAULT_INVESTMENTS = pd.DataFrame({"Investment":["Equity mutual fund","Debt / FD"],"Current value":[400000,100000],"Monthly contribution":[5000,0],"Expected return %":[11.0,7.0],"Taxable":[True,True],"Tax rate %":[12.5,20.0],"Liquidity score (1-10)":[8,9]})
+
+DATE_KEYS = {"loan_start"}
+TABLE_KEYS = {"expenses_data","property_schedule_data","assets_data","bonus_sources_data","investments_data"}
+
+def json_safe(value):
+    """Convert dates, numpy values and tables into portable JSON values."""
+    if isinstance(value,pd.DataFrame):
+        return [{str(k):json_safe(v) for k,v in row.items()} for row in value.to_dict("records")]
+    if isinstance(value,(pd.Timestamp,date)):
+        return value.isoformat()
+    if isinstance(value,np.generic):
+        return value.item()
+    if pd.isna(value):
+        return None
+    return value
+
+def planner_payload(values):
+    return {"app":"WealthPath","data_version":APP_DATA_VERSION,"saved_at":pd.Timestamp.now().isoformat(),"inputs":{k:json_safe(v) for k,v in values.items()}}
+
+def payload_to_csv(payload):
+    rows=[]
+    for field,value in payload.get("inputs",{}).items():
+        section="Tables" if field in TABLE_KEYS else "Inputs"
+        rows.append({"Section":section,"Field":field,"Value":json.dumps(value,ensure_ascii=False)})
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+def csv_to_payload(raw):
+    frame=pd.read_csv(io.BytesIO(raw))
+    required={"Section","Field","Value"}
+    if not required.issubset(frame.columns):
+        raise ValueError("CSV must contain Section, Field and Value columns. Please use the provided template.")
+    inputs={}
+    for _,row in frame.iterrows():
+        field=str(row["Field"]).strip()
+        if not field or field.lower()=="nan":
+            continue
+        raw_value=row["Value"]
+        if pd.isna(raw_value):
+            continue
+        try:
+            inputs[field]=json.loads(str(raw_value))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid Value for '{field}'. Keep text in JSON quotes, for example \"Balanced plan\".") from exc
+    return {"app":"WealthPath","data_version":APP_DATA_VERSION,"inputs":inputs}
+
+def apply_import(payload):
+    if not isinstance(payload,dict) or not isinstance(payload.get("inputs"),dict):
+        raise ValueError("This is not a valid WealthPath backup file.")
+    if payload.get("app") not in (None,"WealthPath"):
+        raise ValueError("This file was not created for WealthPath.")
+    inputs=payload["inputs"]
+    for key,value in inputs.items():
+        if key in TABLE_KEYS:
+            if not isinstance(value,list):
+                raise ValueError(f"'{key}' must contain table rows.")
+            table=pd.DataFrame(value)
+            if "Expected date" in table.columns:
+                table["Expected date"]=pd.to_datetime(table["Expected date"],errors="coerce").dt.date
+            st.session_state[key]=table
+        elif key in DATE_KEYS:
+            parsed=pd.to_datetime(value,errors="coerce")
+            if pd.isna(parsed):
+                raise ValueError(f"'{key}' contains an invalid date.")
+            st.session_state[key]=parsed.date()
+        else:
+            st.session_state[key]=value
+
+def template_values():
+    start=date.today().replace(day=1)
+    d0=pd.Timestamp(start)
+    return {
+        "objective":"Balanced plan","leveraged":False,"run_mc":False,
+        "salary":120000.0,"spouse":0.0,"growth":6.0,"existing_emi":0.0,"buffer_pct":10,
+        "property_value":7500000.0,"loan":5500000.0,"charges":500000.0,"rate":8.5,
+        "tenure_y":20,"annual_prepay":0.0,"loan_start":start,"repayment_mode":"Pre-EMI until final disbursement",
+        "expenses_data":DEFAULT_EXPENSES,"assets_data":DEFAULT_ASSETS,"investments_data":DEFAULT_INVESTMENTS,
+        "property_schedule_data":pd.DataFrame({"Payment / milestone":["Booking / initial payment","Construction / second payment","Registration / possession"],"Expected date":[d0.date(),(d0+pd.DateOffset(months=6)).date(),(d0+pd.DateOffset(months=12)).date()],"Own contribution":[800000.0,600000.0,600000.0],"Loan disbursement":[1100000.0,2200000.0,2200000.0]}),
+        "min_liquidity":300000.0,
+        "bonus_sources_data":pd.DataFrame({"Source":["Annual bonus / incentive"],"Expected date":[(d0+pd.DateOffset(months=5)).date()],"Amount":[0.0]})
+    }
+
+st.title("🏠 WealthPath — Home Loan & Wealth Optimizer")
+st.caption("Compare loan prepayment and investing using your actual income, expenses, assets and investment assumptions.")
+
+with st.expander("💾 Import, export or restore planner data",expanded=False):
+    st.caption("CSV is convenient for bulk editing. JSON is the recommended complete backup. Imported values stay in this browser session; download a backup before clearing or closing the app.")
+    uploaded=st.file_uploader("Import WealthPath data",type=["json","csv"],key="planner_import_file",help="Upload a WealthPath JSON backup or a CSV that follows the provided template.")
+    if st.button("Import and restore data",disabled=uploaded is None,use_container_width=True):
+        try:
+            raw=uploaded.getvalue()
+            if uploaded.name.lower().endswith(".json"):
+                incoming=json.loads(raw.decode("utf-8-sig"))
+            else:
+                incoming=csv_to_payload(raw)
+            apply_import(incoming)
+            st.session_state["import_message"]="Data restored successfully. All calculations have been refreshed from the imported inputs."
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
+    if st.session_state.pop("import_message",None):
+        st.success("Data restored successfully. All calculations have been refreshed from the imported inputs.")
+    sample=planner_payload(template_values())
+    a,b=st.columns(2)
+    a.download_button("Download CSV import template",payload_to_csv(sample),"wealthpath_import_template.csv","text/csv",use_container_width=True)
+    b.download_button("Download sample JSON",json.dumps(sample,ensure_ascii=False,indent=2).encode("utf-8"),"wealthpath_sample_backup.json","application/json",use_container_width=True)
+
 def money(x): return f"₹{x:,.0f}"
 
 def emi(principal, annual_rate, months):
@@ -104,14 +216,39 @@ def emi(principal, annual_rate, months):
     return principal/months if r==0 else principal*r*(1+r)**months/((1+r)**months-1)
 
 def effective_return(row):
-    gross=float(row["Expected return %"])/100
-    tax=float(row["Tax rate %"])/100 if row["Taxable"] else 0
-    return gross*(1-tax)
+    """Return a row's post-tax annual rate without trusting editor values."""
+    gross=pd.to_numeric(row.get("Expected return %"),errors="coerce")
+    tax=pd.to_numeric(row.get("Tax rate %"),errors="coerce")
+    gross=0.0 if pd.isna(gross) else float(gross)/100
+    tax=0.0 if pd.isna(tax) else float(np.clip(tax,0,100))/100
+    taxable=row.get("Taxable",False)
+    taxable=False if pd.isna(taxable) else bool(taxable)
+    return gross*(1-tax if taxable else 1)
 
 def weighted_return(inv):
-    weights=inv["Current value"]+inv["Monthly contribution"]*12
-    if weights.sum()<=0: return 0.0
-    return float(np.average(inv.apply(effective_return,axis=1),weights=weights))
+    """Calculate the weighted post-tax return and ignore incomplete editor rows."""
+    if not isinstance(inv,pd.DataFrame) or inv.empty:
+        return 0.0
+
+    data=inv.copy()
+    for column in ["Current value","Monthly contribution","Expected return %","Tax rate %"]:
+        if column not in data.columns:
+            data[column]=0.0
+        data[column]=pd.to_numeric(data[column],errors="coerce")
+    if "Taxable" not in data.columns:
+        data["Taxable"]=False
+
+    # A blank expected-return cell means the row is not ready for projection.
+    data=data.dropna(subset=["Expected return %"])
+    if data.empty:
+        return 0.0
+    data[["Current value","Monthly contribution","Tax rate %"]]=data[["Current value","Monthly contribution","Tax rate %"]].fillna(0)
+    weights=(data["Current value"].clip(lower=0)+data["Monthly contribution"].clip(lower=0)*12)
+    valid=weights>0
+    if not valid.any():
+        return 0.0
+    returns=data.loc[valid].apply(effective_return,axis=1).astype(float)
+    return float(np.average(returns,weights=weights.loc[valid]))
 
 def month_number(start, value):
     """Convert a calendar date into a 1-based projection month."""
@@ -195,27 +332,24 @@ def simulate(name, loan, rate, tenure_m, payment, start_corpus, inv_r, invest_sh
     risk=invest_share*8+(2 if leveraged else 0)
     return Result(name,total_interest,close_month,corpus,corpus+property_equity-balance,invest_share*10,risk,rows)
 
-st.title("🏠 WealthPath — Home Loan & Wealth Optimizer")
-st.caption("Compare loan prepayment and investing using your actual income, expenses, assets and investment assumptions.")
-
 with st.sidebar:
     st.header("Your priority")
-    objective=st.selectbox("What matters most?",["Balanced plan","Close loan fastest","Maximise net worth","Lowest risk","Highest liquidity"],
+    objective=st.selectbox("What matters most?",["Balanced plan","Close loan fastest","Maximise net worth","Lowest risk","Highest liquidity"],key="objective",
         help="This changes how strategies are ranked; it does not change the underlying calculations.")
-    leveraged=st.toggle("Can loan proceeds be invested?",False,help="Normally No for a home loan. Yes models a high-risk leveraged scenario.")
-    run_mc=st.toggle("Run 10,000 market simulations",False)
+    leveraged=st.toggle("Can loan proceeds be invested?",False,key="leveraged",help="Normally No for a home loan. Yes models a high-risk leveraged scenario.")
+    run_mc=st.toggle("Run 10,000 market simulations",False,key="run_mc")
 
 t1,t2,t3,t4=st.tabs(["1 · Income & expenses","2 · Property funding & loan","3 · Assets & investments","4 · Plan & results"])
 with t1:
     st.subheader("Monthly cash flow")
     st.info("The tool calculates available surplus; you do not enter a planned investment amount.")
     c1,c2,c3=st.columns(3)
-    salary=c1.number_input("Monthly in-hand income",0.0,value=120000.0,step=5000.0,help="Household take-home income available before expenses and EMIs.")
-    spouse=c2.number_input("Spouse/other monthly income",0.0,value=0.0,step=5000.0)
-    growth=c3.number_input("Annual income growth %",0.0,30.0,6.0,0.5,help="Raises future surplus; treated as an assumption, not guaranteed.")
-    expenses=st.data_editor(pd.DataFrame({"Expense":["Household","Education","Insurance & medical","Travel","Other"],"Monthly amount":[35000,5000,5000,3000,2000]}),num_rows="dynamic",use_container_width=True)
-    existing_emi=st.number_input("Other loan EMIs",0.0,value=0.0,step=1000.0)
-    buffer_pct=st.slider("Safety buffer (% of income)",0,30,10,help="Protected cash not allocated to investment or prepayment.")
+    salary=c1.number_input("Monthly in-hand income",0.0,value=120000.0,step=5000.0,key="salary",help="Household take-home income available before expenses and EMIs.")
+    spouse=c2.number_input("Spouse/other monthly income",0.0,value=0.0,step=5000.0,key="spouse")
+    growth=c3.number_input("Annual income growth %",0.0,30.0,6.0,0.5,key="growth",help="Raises future surplus; treated as an assumption, not guaranteed.")
+    expenses=st.data_editor(DEFAULT_EXPENSES,num_rows="dynamic",use_container_width=True,key="expenses_data")
+    existing_emi=st.number_input("Other loan EMIs",0.0,value=0.0,step=1000.0,key="existing_emi")
+    buffer_pct=st.slider("Safety buffer (% of income)",0,30,10,key="buffer_pct",help="Protected cash not allocated to investment or prepayment.")
     total_income=salary+spouse; total_exp=float(expenses["Monthly amount"].sum())
     safe_surplus=max(0,total_income-total_exp-existing_emi-total_income*buffer_pct/100)
     st.metric("Calculated safe monthly surplus",money(safe_surplus),help="Income − expenses − other EMIs − safety buffer.")
@@ -223,14 +357,14 @@ with t1:
 with t2:
     st.subheader("Home loan")
     c1,c2,c3=st.columns(3)
-    property_value=c1.number_input("Property value",0.0,value=7500000.0,step=100000.0)
-    loan=c2.number_input("Loan amount",0.0,value=5500000.0,step=100000.0)
-    charges=c3.number_input("Registration and other charges",0.0,value=500000.0,step=50000.0)
-    rate=c1.number_input("Current interest rate %",0.0,30.0,8.5,0.05,help="Monthly reducing-balance rate. Update this when a floating rate changes.")
-    tenure_y=int(c2.number_input("Remaining tenure (years)",1,40,20))
-    annual_prepay=c3.number_input("Optional annual lump sum",0.0,value=0.0,step=10000.0,help="Bonus or other amount available once each year, separate from monthly surplus.")
-    loan_start=st.date_input("Loan/report start date",value=date.today().replace(day=1),help="Used to convert Month 1, Month 2 and later actions into calendar months in the Excel report.")
-    repayment_mode=st.radio("Repayment during staged disbursement",["Pre-EMI until final disbursement","Full EMI from first disbursement"],horizontal=True,
+    property_value=c1.number_input("Property value",0.0,value=7500000.0,step=100000.0,key="property_value")
+    loan=c2.number_input("Loan amount",0.0,value=5500000.0,step=100000.0,key="loan")
+    charges=c3.number_input("Registration and other charges",0.0,value=500000.0,step=50000.0,key="charges")
+    rate=c1.number_input("Current interest rate %",0.0,30.0,8.5,0.05,key="rate",help="Monthly reducing-balance rate. Update this when a floating rate changes.")
+    tenure_y=int(c2.number_input("Remaining tenure (years)",1,40,20,key="tenure_y"))
+    annual_prepay=c3.number_input("Optional annual lump sum",0.0,value=0.0,step=10000.0,key="annual_prepay",help="Bonus or other amount available once each year, separate from monthly surplus.")
+    loan_start=st.date_input("Loan/report start date",value=date.today().replace(day=1),key="loan_start",help="Used to convert Month 1, Month 2 and later actions into calendar months in the Excel report.")
+    repayment_mode=st.radio("Repayment during staged disbursement",["Pre-EMI until final disbursement","Full EMI from first disbursement"],horizontal=True,key="repayment_mode",
         help="Pre-EMI pays only interest on the amount already disbursed. Full EMI starts principal repayment from the first drawdown. Confirm your bank's actual method.")
     base_emi=emi(loan,rate,tenure_y*12)
     own_contribution=max(0,property_value+charges-loan)
@@ -242,7 +376,7 @@ with t2:
         "Payment / milestone":["Booking / initial payment","Construction / second payment","Registration / possession"],
         "Expected date":[d0.date(),(d0+pd.DateOffset(months=6)).date(),(d0+pd.DateOffset(months=12)).date()],
         "Own contribution":[own_contribution*.40,own_contribution*.30,own_contribution*.30],
-        "Loan disbursement":[loan*.20,loan*.40,loan*.40]}),num_rows="dynamic",use_container_width=True,
+        "Loan disbursement":[loan*.20,loan*.40,loan*.40]}),num_rows="dynamic",use_container_width=True,key="property_schedule_data",
         column_config={
             "Expected date":st.column_config.DateColumn(help="Estimated date on which this tranche must reach the builder/seller."),
             "Own contribution":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="Money paid from savings—not borrowed money."),
@@ -257,7 +391,7 @@ with t2:
 
 with t3:
     st.subheader("Existing assets")
-    assets=st.data_editor(pd.DataFrame({"Asset":["Bank / emergency fund","FD / debt","Equity / mutual funds","PF / NPS","Gold"],"Current value":[300000,100000,500000,400000,100000],"Use for own contribution %":[0,50,0,0,0],"Keep invested in wealth plan %":[0,0,100,0,0]}),num_rows="dynamic",use_container_width=True,
+    assets=st.data_editor(DEFAULT_ASSETS,num_rows="dynamic",use_container_width=True,key="assets_data",
         column_config={
             "Use for own contribution %":st.column_config.NumberColumn(min_value=0,max_value=100,help="The portion that can be sold or withdrawn to pay the property cost."),
             "Keep invested in wealth plan %":st.column_config.NumberColumn(min_value=0,max_value=100,help="The portion that remains invested and forms the opening investment corpus.")})
@@ -267,13 +401,13 @@ with t3:
     overlap=(pd.to_numeric(assets["Use for own contribution %"],errors="coerce").fillna(0)+pd.to_numeric(assets["Keep invested in wealth plan %"],errors="coerce").fillna(0)>100).any()
     if overlap: st.error("An asset cannot be both spent on the property and kept invested. For every row, the two percentages together must not exceed 100%.")
     x,y=st.columns(2); x.metric("Assets available for own contribution",money(contribution_assets)); y.metric("Opening investment corpus",money(usable_assets))
-    min_liquidity=st.number_input("Minimum cash liquidity to keep in hand",0.0,value=300000.0,step=25000.0,
+    min_liquidity=st.number_input("Minimum cash liquidity to keep in hand",0.0,value=300000.0,step=25000.0,key="min_liquidity",
         help="Cash reserve that should remain untouched after every property payment and strategy action.")
-    bonus_sources=st.data_editor(pd.DataFrame({"Source":["Annual bonus / incentive"],"Expected date":[(pd.Timestamp(loan_start)+pd.DateOffset(months=5)).date()],"Amount":[0.0]}),num_rows="dynamic",use_container_width=True,
+    bonus_sources=st.data_editor(pd.DataFrame({"Source":["Annual bonus / incentive"],"Expected date":[(pd.Timestamp(loan_start)+pd.DateOffset(months=5)).date()],"Amount":[0.0]}),num_rows="dynamic",use_container_width=True,key="bonus_sources_data",
         column_config={"Expected date":st.column_config.DateColumn(),"Amount":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="A one-time inflow that can be used toward the property contribution.")})
     st.subheader("Investment assumptions")
     st.caption("Enter the actual holdings/options you want evaluated. Returns are projections, not guarantees.")
-    investments=st.data_editor(pd.DataFrame({"Investment":["Equity mutual fund","Debt / FD"],"Current value":[400000,100000],"Monthly contribution":[5000,0],"Expected return %":[11.0,7.0],"Taxable":[True,True],"Tax rate %":[12.5,20.0],"Liquidity score (1-10)":[8,9]}),num_rows="dynamic",use_container_width=True)
+    investments=st.data_editor(DEFAULT_INVESTMENTS,num_rows="dynamic",use_container_width=True,key="investments_data")
     inv_r=weighted_return(investments)
     st.metric("Weighted expected post-tax return",f"{inv_r*100:.2f}%")
 
@@ -435,6 +569,20 @@ with t4:
         output.seek(0)
         return output.getvalue()
     st.download_button("Download complete month-wise Excel report",data=build_excel_report(),file_name="wealthpath_month_wise_plan.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    current_values={
+        "objective":objective,"leveraged":leveraged,"run_mc":run_mc,
+        "salary":salary,"spouse":spouse,"growth":growth,"existing_emi":existing_emi,"buffer_pct":buffer_pct,
+        "property_value":property_value,"loan":loan,"charges":charges,"rate":rate,"tenure_y":tenure_y,
+        "annual_prepay":annual_prepay,"loan_start":loan_start,"repayment_mode":repayment_mode,
+        "expenses_data":expenses,"property_schedule_data":property_schedule,"assets_data":assets,
+        "min_liquidity":min_liquidity,"bonus_sources_data":bonus_sources,"investments_data":investments
+    }
+    current_backup=planner_payload(current_values)
+    st.subheader("Save or transfer your entered data")
+    st.caption("JSON restores the complete planner exactly. CSV contains the same inputs in an editable import format. Calculated results will be regenerated when imported.")
+    e1,e2=st.columns(2)
+    e1.download_button("Export complete data as JSON",json.dumps(current_backup,ensure_ascii=False,indent=2).encode("utf-8"),"wealthpath_complete_backup.json","application/json",use_container_width=True)
+    e2.download_button("Export entered data as CSV",payload_to_csv(current_backup),"wealthpath_entered_data.csv","text/csv",use_container_width=True)
     if run_mc:
         rng=np.random.default_rng(42); sims=10000
         returns=np.clip(rng.normal(inv_r,0.05,sims),-0.20,0.30)
