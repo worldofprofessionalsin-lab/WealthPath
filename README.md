@@ -1,8 +1,8 @@
 # WealthPath Streamlit
 
-Version 4.3 adds CSV import/templates and complete JSON backup/restore. It also
-includes the schedule and investment-editor validation fixes from versions 4.1
-and 4.2.
+Version 4.4 adds clearer strategy explanations and a complete monthly property-
+funding and cash trail to the Excel report. It also includes CSV/JSON backup,
+schedule validation, and investment-editor validation from earlier versions.
 
 ## Data import and backup
 
@@ -49,5 +49,7 @@ GitHub Pages cannot run Python. It would require rewriting the calculation engin
 - Investment returns are weighted and reduced by the entered tax rate.
 - EMI is redirected into investment after the loan closes.
 - The Excel download contains inputs, property funding dates, contribution sources, contribution feasibility, year-end liquidity, strategy comparison, expense/asset/investment details, and a separate 360-month action schedule for every strategy.
-- Each monthly schedule shows the calendar month, action to take, EMI, interest, principal, prepayment, investment, closing loan balance, projected investment corpus, and net-worth indicator.
+- Each monthly schedule separately shows the buyer's own contribution, the bank's loan contribution, total property payment, closing own-contribution fund, and closing cash balance.
+- Conservative blend means 25% of available surplus is invested and 75% is used for monthly loan prepayment, after reserving required property contributions and protected liquidity.
+- Each monthly schedule also shows the calendar month, action to take, EMI, interest, principal, prepayment, investment, closing loan balance, projected investment corpus, and net-worth indicator.
 - Results are projections and market-linked returns are not guaranteed.
