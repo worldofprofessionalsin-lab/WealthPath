@@ -25,4 +25,6 @@ GitHub Pages cannot run Python. It would require rewriting the calculation engin
 - Existing assets are counted only to the percentage marked available.
 - Investment returns are weighted and reduced by the entered tax rate.
 - EMI is redirected into investment after the loan closes.
+- The Excel download contains inputs, strategy comparison, expense/asset/investment details, and a separate 360-month action schedule for every strategy.
+- Each monthly schedule shows the calendar month, action to take, EMI, interest, principal, prepayment, investment, closing loan balance, projected investment corpus, and net-worth indicator.
 - Results are projections and market-linked returns are not guaranteed.
