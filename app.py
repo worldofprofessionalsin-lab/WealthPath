@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="WealthPath", page_icon="🏠", layout="wide")
@@ -404,11 +404,15 @@ with t2:
             "Loan disbursement":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="Loan amount expected from the bank on this date. Interest begins only after disbursement.")}))
     entered_own=float(pd.to_numeric(property_schedule["Own contribution"],errors="coerce").fillna(0).sum())
     entered_loan=float(pd.to_numeric(property_schedule["Loan disbursement"],errors="coerce").fillna(0).sum())
+    undated_amount=(pd.to_numeric(property_schedule["Own contribution"],errors="coerce").fillna(0)+pd.to_numeric(property_schedule["Loan disbursement"],errors="coerce").fillna(0))>0
+    invalid_dates=pd.to_datetime(property_schedule["Expected date"],errors="coerce").isna()
     q1,q2=st.columns(2)
     q1.metric("Own contribution scheduled",money(entered_own),delta=money(entered_own-own_contribution))
     q2.metric("Loan disbursement scheduled",money(entered_loan),delta=money(entered_loan-loan))
     if abs(entered_own-own_contribution)>1 or abs(entered_loan-loan)>1:
         st.warning("The dated tranches must total the calculated own contribution and the sanctioned loan amount before the recommendation can be treated as complete.")
+    if (undated_amount & invalid_dates).any():
+        st.error("Every non-zero property tranche needs a valid date. Undated amounts are excluded from the monthly contribution, disbursement and EMI schedules.")
 
 with t3:
     st.subheader("Existing assets")
@@ -557,7 +561,91 @@ with t4:
             ["Annual income growth %",growth,"Applied to future monthly capacity"],
             ["Loan proceeds invested","Yes" if leveraged else "No","Normally No for a home loan"],
         ],columns=["Input / output","Value","How it affects the plan"])
+        contribution_monthly=pd.DataFrame(contribution_rows)
+        own_paid_by_month={} if contribution_monthly.empty else contribution_monthly.set_index("Month")["Own contribution due"].to_dict()
+        closing_fund_by_month={} if contribution_monthly.empty else contribution_monthly.set_index("Month")["Closing contribution fund"].to_dict()
+        opening_fund_by_month={} if contribution_monthly.empty else contribution_monthly.set_index("Month")["Opening contribution fund"].to_dict()
+        saving_by_month={} if contribution_monthly.empty else contribution_monthly.set_index("Month")["Monthly saving required"].to_dict()
+        source_inflow_by_month={} if contribution_monthly.empty else contribution_monthly.set_index("Month")["One-time source"].to_dict()
+
+        def strategy_monthly(result):
+            monthly=pd.DataFrame(result.rows)
+            monthly.insert(1,"Calendar month",monthly["Month"].apply(lambda m:pd.Timestamp(loan_start)+pd.DateOffset(months=m-1)))
+            monthly["Opening own-contribution fund"]=monthly["Month"].map(opening_fund_by_month).fillna(0.0)
+            monthly["Monthly saving reserved"]=monthly["Month"].map(saving_by_month).fillna(0.0)
+            monthly["Bonus / one-time inflow"]=monthly["Month"].map(source_inflow_by_month).fillna(0.0)
+            monthly["Own contribution paid"]=monthly["Month"].map(own_paid_by_month).fillna(0.0)
+            monthly["Loan contribution paid"]=monthly["Loan disbursed"]
+            monthly["Total property payment"]=monthly["Own contribution paid"]+monthly["Loan contribution paid"]
+            monthly["Closing own-contribution fund"]=monthly["Month"].map(closing_fund_by_month).fillna(0.0)
+            monthly["Monthly protected reserve added"]=monthly["Month"].apply(lambda m:monthly_buffer*(1+growth/100)**((m-1)//12))
+            monthly["Protected cash reserve (not for property)"]=min_liquidity+monthly["Monthly protected reserve added"].cumsum()
+            monthly["Total cash held"]=monthly["Protected cash reserve (not for property)"]+monthly["Closing own-contribution fund"]
+            monthly["Loan payment this month"]=monthly["Scheduled EMI"]+monthly["Prepayment"]
+            monthly["Wealth investment this month"]=monthly["Investment"]
+            monthly["Net worth indicator"]=monthly["Investment corpus"]+(loan-monthly["Loan outstanding"])
+            return monthly
+
+        detailed={result.name:strategy_monthly(result) for result in results}
+        selected_monthly=detailed[chosen]
+        action_plan=selected_monthly[[
+            "Month","Calendar month","Action","Opening own-contribution fund","Monthly saving reserved",
+            "Bonus / one-time inflow","Own contribution paid","Loan contribution paid","Total property payment",
+            "Closing own-contribution fund","Protected cash reserve (not for property)","Scheduled EMI","Interest",
+            "Principal repaid","Prepayment","Loan outstanding","Wealth investment this month","Investment corpus"
+        ]].copy()
+        action_plan.insert(2,"What to do this month",action_plan.apply(
+            lambda r:(f"Pay ₹{r['Own contribution paid']:,.0f} from the contribution fund; request ₹{r['Loan contribution paid']:,.0f} from the lender. "
+                      f"Pay scheduled loan amount ₹{r['Scheduled EMI']:,.0f}"
+                      + (f" and voluntary prepayment ₹{r['Prepayment']:,.0f}" if r['Prepayment']>0 else "")
+                      + (f"; invest ₹{r['Wealth investment this month']:,.0f}." if r['Wealth investment this month']>0 else ".")),axis=1))
+
+        # Reconstruct a transparent FIFO trail for the contribution fund. The
+        # protected minimum is withheld from Bank / emergency fund first.
+        asset_sources=[]; protected_left=min_liquidity
+        ordered_assets=assets.copy()
+        if "Asset" in ordered_assets.columns:
+            ordered_assets["_priority"]=ordered_assets["Asset"].astype(str).str.contains("bank|emergency",case=False,regex=True).map({True:0,False:1})
+            ordered_assets=ordered_assets.sort_values("_priority",kind="stable")
+        for _,row in ordered_assets.iterrows():
+            name=str(row.get("Asset") or "Other asset")
+            allocated=max(0,float(pd.to_numeric(row.get("Current value"),errors="coerce") or 0)*float(pd.to_numeric(row.get("Use for own contribution %"),errors="coerce") or 0)/100)
+            protected=min(allocated,protected_left); protected_left-=protected
+            usable=max(0,allocated-protected)
+            if allocated>0: asset_sources.append({"Source":name,"Allocated to contribution":allocated,"Protected / unavailable":protected,"Opening usable amount":usable})
+        source_balances={x["Source"]:x["Opening usable amount"] for x in asset_sources}
+        fund_ledger=[]
+        for m in range(1,max(360,last_contribution_month)+1):
+            month_date=pd.Timestamp(loan_start)+pd.DateOffset(months=m-1)
+            saving=float(saving_by_month.get(m,0)); bonus=float(source_inflow_by_month.get(m,0)); due=float(own_paid_by_month.get(m,0))
+            if saving: source_balances["Monthly income savings"]=source_balances.get("Monthly income savings",0)+saving
+            if bonus: source_balances["Bonus / one-time sources"]=source_balances.get("Bonus / one-time sources",0)+bonus
+            remaining=due
+            for source in list(source_balances):
+                used=min(source_balances[source],remaining)
+                if used or (m==1 and source in [x["Source"] for x in asset_sources]):
+                    fund_ledger.append({"Month":m,"Calendar month":month_date,"Fund source":source,"Opening / inflow available":source_balances[source],"Used for property":used,"Closing source balance":source_balances[source]-used})
+                source_balances[source]-=used; remaining-=used
+                if remaining<=0: break
+            if due or saving or bonus:
+                fund_ledger.append({"Month":m,"Calendar month":month_date,"Fund source":"TOTAL / CHECK","Opening / inflow available":np.nan,"Used for property":due,"Closing source balance":sum(source_balances.values())})
+            if m>=last_contribution_month: break
+        fund_sources=pd.DataFrame(asset_sources)
+        fund_ledger=pd.DataFrame(fund_ledger)
+
+        guide=pd.DataFrame([
+            ["Start here","Monthly Action Plan",f"Month-by-month instructions for {chosen}."],
+            ["Builder funding","Contribution Plan","Opening fund + monthly saving + bonus − own payment = closing fund."],
+            ["Where own money comes from","Fund Source Ledger","FIFO use of eligible assets, monthly savings and bonus; protected cash is excluded."],
+            ["Loan","Loan Schedule",f"Disbursement, EMI, interest, principal, prepayment and balance for {chosen}."],
+            ["Investments","Investment Schedule",f"Opening value + investment + growth = closing corpus for {chosen}."],
+            ["Emergency reserve","Protected Reserve","Cash deliberately kept outside property payments, prepayments and investments."],
+            ["Compare choices","Strategy Comparison","30-year outcome comparison for all strategies."],
+        ],columns=["Step","Worksheet","What it tells you"])
+
         with pd.ExcelWriter(output,engine="openpyxl") as writer:
+            guide.to_excel(writer,sheet_name="Read Me First",index=False,startrow=4)
+            action_plan.to_excel(writer,sheet_name="Monthly Action Plan",index=False,startrow=4)
             inputs.to_excel(writer,sheet_name="Inputs & Assumptions",index=False,startrow=2)
             table.to_excel(writer,sheet_name="Strategy Comparison",index=False,startrow=2)
             expenses.to_excel(writer,sheet_name="Expense Details",index=False,startrow=2)
@@ -566,53 +654,61 @@ with t4:
             property_schedule.to_excel(writer,sheet_name="Property Funding Dates",index=False,startrow=2)
             bonus_sources.to_excel(writer,sheet_name="Contribution Sources",index=False,startrow=2)
             pd.DataFrame(contribution_rows).to_excel(writer,sheet_name="Contribution Plan",index=False,startrow=2)
+            fund_sources.to_excel(writer,sheet_name="Fund Sources",index=False,startrow=2)
+            fund_ledger.to_excel(writer,sheet_name="Fund Source Ledger",index=False,startrow=2)
+            selected_monthly[["Month","Calendar month","Loan disbursed","Opening loan balance","Scheduled EMI","Interest","Principal repaid","Prepayment","Loan outstanding"]].to_excel(writer,sheet_name="Loan Schedule",index=False,startrow=2)
+            selected_monthly[["Month","Calendar month","Opening investment value","Wealth investment this month","Expected investment growth","Investment corpus","EMI redirected after closure"]].to_excel(writer,sheet_name="Investment Schedule",index=False,startrow=2)
+            selected_monthly[["Month","Calendar month","Monthly protected reserve added","Protected cash reserve (not for property)"]].to_excel(writer,sheet_name="Protected Reserve",index=False,startrow=2)
             for result in results:
-                monthly=pd.DataFrame(result.rows)
-                monthly.insert(1,"Calendar month",monthly["Month"].apply(lambda m:pd.Timestamp(loan_start)+pd.DateOffset(months=m-1)))
-                contribution_monthly=pd.DataFrame(contribution_rows)
-                if contribution_monthly.empty:
-                    own_paid_by_month={}
-                    closing_fund_by_month={}
-                else:
-                    own_paid_by_month=contribution_monthly.set_index("Month")["Own contribution due"].to_dict()
-                    closing_fund_by_month=contribution_monthly.set_index("Month")["Closing contribution fund"].to_dict()
-                monthly["Own contribution paid"]=monthly["Month"].map(own_paid_by_month).fillna(0.0)
-                monthly["Loan contribution paid"]=monthly["Loan disbursed"]
-                monthly["Total property payment"]=monthly["Own contribution paid"]+monthly["Loan contribution paid"]
-                monthly["Protected cash added"]=monthly["Month"].apply(lambda m:monthly_buffer*(1+growth/100)**((m-1)//12))
-                monthly["Projected cash liquidity"]=min_liquidity+monthly["Protected cash added"].cumsum()
-                monthly["Liquidity surplus above minimum"]=monthly["Projected cash liquidity"]-min_liquidity
-                monthly["Closing own-contribution fund"]=monthly["Month"].map(closing_fund_by_month).fillna(0.0)
-                monthly["Closing cash balance"]=monthly["Projected cash liquidity"]+monthly["Closing own-contribution fund"]
-                monthly["Total payment this month"]=monthly["Scheduled EMI"]+monthly["Prepayment"]+monthly["Investment"]
-                monthly["Net worth indicator"]=monthly["Investment corpus"]+(loan-monthly["Loan outstanding"])
+                monthly=detailed[result.name]
                 sheet_name=result.name[:31]
                 monthly.to_excel(writer,sheet_name=sheet_name,index=False,startrow=2)
                 ws=writer.book[sheet_name]
                 ws["A1"]=f"Monthly action plan — {result.name}"
                 ws["A2"]=f"{strategy_meanings[result.name]} Own contribution and loan contribution show property funding; closing cash balance excludes investment value."
-            for ws in writer.book.worksheets:
-                ws.freeze_panes="A4"
-                ws.auto_filter.ref=f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
+            wb=writer.book
+            wb["Read Me First"]["A1"]="WealthPath report guide"
+            wb["Read Me First"]["A2"]="Start with Monthly Action Plan. Green amounts are available/actionable; amber amounts are protected and must not be used for the property."
+            wb["Monthly Action Plan"]["A1"]=f"Monthly Action Plan — {chosen}"
+            wb["Monthly Action Plan"]["A2"]="Own contribution comes from the contribution fund. Loan contribution is requested from the lender. Protected reserve is unavailable for both."
+            wb["Monthly Action Plan"]["A3"]="Money trail: opening contribution fund + monthly saving + bonus − own contribution paid = closing contribution fund."
+            for title,note in {"Contribution Plan":"Tracks only money earmarked for your share of builder payments.","Fund Sources":"Shows which entered assets are eligible and which amount is protected.","Fund Source Ledger":"Shows exactly which fund category is used for each own-contribution payment.","Loan Schedule":f"Loan repayment trail for {chosen}.","Investment Schedule":f"Investment trail for {chosen}.","Protected Reserve":"Not available for the builder, loan prepayment or investment."}.items():
+                wb[title]["A1"]=title; wb[title]["A2"]=note
+            for ws in wb.worksheets:
+                header_row=5 if ws.title in ["Read Me First","Monthly Action Plan"] else 3
+                ws.freeze_panes=f"A{header_row+1}"
+                ws.auto_filter.ref=f"A{header_row}:{get_column_letter(ws.max_column)}{ws.max_row}"
                 ws.sheet_view.showGridLines=False
                 if not ws["A1"].value: ws["A1"]=ws.title
                 ws["A1"].font=Font(bold=True,size=16,color="174B3A")
-                for cell in ws[3]:
+                ws["A2"].alignment=Alignment(wrap_text=True,vertical="top")
+                for cell in ws[header_row]:
                     cell.font=Font(bold=True,color="FFFFFF")
                     cell.fill=PatternFill("solid",fgColor="174B3A")
+                    cell.alignment=Alignment(wrap_text=True,vertical="center")
+                ws.row_dimensions[header_row].height=32
                 for column_cells in ws.columns:
                     letter=column_cells[0].column_letter
-                    width=min(42,max(12,max(len(str(c.value or "")) for c in column_cells[:80])+2))
+                    width=min(45,max(12,max(len(str(c.value or "")) for c in column_cells[:80])+2))
                     ws.column_dimensions[letter].width=width
                 for row in ws.iter_rows():
                     for cell in row:
-                        if isinstance(cell.value,(int,float)) and any(k in str(ws.cell(3,cell.column).value or "").lower() for k in ["amount","income","expense","emi","interest","principal","balance","prepayment","investment","corpus","worth","value","payment","capacity"]):
+                        if isinstance(cell.value,(int,float)) and any(k in str(ws.cell(header_row,cell.column).value or "").lower() for k in ["amount","income","expense","emi","interest","principal","balance","prepayment","investment","corpus","worth","value","payment","capacity","fund","saving","reserve","liquidity","disbursed","source"]):
                             cell.number_format='₹#,##0.00;[Red]-₹#,##0.00'
-                if ws.title not in ["Inputs & Assumptions","Strategy Comparison","Expense Details","Asset Details","Investment Details","Property Funding Dates","Contribution Sources","Contribution Plan"]:
-                    for cell in ws[4]:
-                        if cell.value=="Calendar month":
-                            for c in ws.iter_cols(min_col=cell.column,max_col=cell.column,min_row=4):
-                                for x in c: x.number_format="mmm yyyy"
+                for cell in ws[header_row]:
+                    if cell.value=="Calendar month":
+                        for c in ws.iter_cols(min_col=cell.column,max_col=cell.column,min_row=header_row+1):
+                            for x in c: x.number_format="mmm yyyy"
+                if ws.title=="Monthly Action Plan":
+                    ws.column_dimensions["C"].width=72
+                    ws.column_dimensions["D"].width=34
+                    for row in ws.iter_rows(min_row=header_row+1,max_row=ws.max_row): row[2].alignment=Alignment(wrap_text=True,vertical="top")
+                if ws.title in ["Monthly Action Plan","Contribution Plan","Fund Source Ledger"]:
+                    for cell in ws[header_row]:
+                        label=str(cell.value or "").lower()
+                        if "protected" in label: cell.fill=PatternFill("solid",fgColor="B45309")
+                        elif "closing" in label or "what to do" in label: cell.fill=PatternFill("solid",fgColor="0F766E")
+                ws.auto_filter.ref=f"A{header_row}:{get_column_letter(ws.max_column)}{ws.max_row}"
         output.seek(0)
         return output.getvalue()
     st.download_button("Download complete month-wise Excel report",data=build_excel_report(),file_name="wealthpath_month_wise_plan.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
