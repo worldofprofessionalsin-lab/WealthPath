@@ -1,8 +1,9 @@
 # WealthPath Streamlit
 
-Version 4.4 adds clearer strategy explanations and a complete monthly property-
-funding and cash trail to the Excel report. It also includes CSV/JSON backup,
-schedule validation, and investment-editor validation from earlier versions.
+Version 4.5 fixes CSV/JSON table restoration on current Streamlit releases by
+separating imported table data from read-only data-editor widget state. It also
+includes the strategy explanations and complete monthly property-funding and
+cash trail introduced in version 4.4.
 
 ## Data import and backup
 
