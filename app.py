@@ -447,6 +447,15 @@ specs=[
     ("Only EMI",0.0,None),("Monthly prepayment",0.0,"monthly"),("Quarterly prepayment",0.0,"quarterly"),
     ("Annual prepayment",0.0,"annual"),("Invest everything",1.0,None),("50% invest + 50% prepay",0.5,"monthly"),
     ("Conservative blend",0.25,"monthly")]
+strategy_meanings={
+    "Only EMI":"Pay only the scheduled EMI and retain the available surplus as cash.",
+    "Monthly prepayment":"Use the available surplus to reduce the loan every month.",
+    "Quarterly prepayment":"Accumulate the available surplus and reduce the loan every quarter.",
+    "Annual prepayment":"Accumulate the available surplus and reduce the loan once a year.",
+    "Invest everything":"Invest all available surplus; do not make voluntary loan prepayments.",
+    "50% invest + 50% prepay":"Split the available surplus equally between investing and loan prepayment.",
+    "Conservative blend":"Use 75% of available surplus for monthly loan prepayment and invest 25%. This prioritises debt reduction and lower risk while retaining some long-term growth potential."
+}
 results=[simulate(n,loan,rate,tenure_y*12,payment,usable_assets,inv_r,s,f,growth,leveraged,loan_by_month,contribution_reserve,repayment_mode) for n,s,f in specs]
 baseline=results[0]
 
@@ -482,7 +491,11 @@ with t4:
         st.dataframe(contribution_view.style.format({c:money for c in ["Opening contribution fund","Monthly saving required","One-time source","Own contribution due","Closing contribution fund","Protected liquidity","Funding gap"]}),use_container_width=True,hide_index=True)
 
     st.markdown(f"<div class='best'><b>Recommended for “{objective}”:</b> {best.name}<br>Allocate {next(s for n,s,f in specs if n==best.name)*100:.0f}% of the calculated surplus to investments and the remainder to prepayment.</div>",unsafe_allow_html=True)
-    table=pd.DataFrame([{"Strategy":r.name,"Total interest":r.interest,"Interest saved":baseline.interest-r.interest,"Loan closes in (years)":r.close_month/12,"Investment corpus (30y)":r.corpus,"Projected net worth":r.net_worth,"Liquidity / 10":r.liquidity,"Risk / 10":r.risk} for r in results]).sort_values("Projected net worth",ascending=False)
+    st.caption(strategy_meanings[best.name])
+    with st.expander("What does each strategy mean?"):
+        for strategy_name,meaning in strategy_meanings.items():
+            st.markdown(f"**{strategy_name}:** {meaning}")
+    table=pd.DataFrame([{"Strategy":r.name,"Meaning":strategy_meanings[r.name],"Total interest":r.interest,"Interest saved":baseline.interest-r.interest,"Loan closes in (years)":r.close_month/12,"Investment corpus (30y)":r.corpus,"Projected net worth":r.net_worth,"Liquidity / 10":r.liquidity,"Risk / 10":r.risk} for r in results]).sort_values("Projected net worth",ascending=False)
     st.dataframe(table.style.format({"Total interest":money,"Interest saved":money,"Loan closes in (years)":"{:.1f}","Investment corpus (30y)":money,"Projected net worth":money,"Liquidity / 10":"{:.1f}","Risk / 10":"{:.1f}"}),use_container_width=True)
     chosen=st.selectbox("View action plan",[r.name for r in results],index=[r.name for r in results].index(best.name))
     selected=next(r for r in results if r.name==chosen); schedule=pd.DataFrame(selected.rows)
@@ -534,16 +547,28 @@ with t4:
             for result in results:
                 monthly=pd.DataFrame(result.rows)
                 monthly.insert(1,"Calendar month",monthly["Month"].apply(lambda m:pd.Timestamp(loan_start)+pd.DateOffset(months=m-1)))
+                contribution_monthly=pd.DataFrame(contribution_rows)
+                if contribution_monthly.empty:
+                    own_paid_by_month={}
+                    closing_fund_by_month={}
+                else:
+                    own_paid_by_month=contribution_monthly.set_index("Month")["Own contribution due"].to_dict()
+                    closing_fund_by_month=contribution_monthly.set_index("Month")["Closing contribution fund"].to_dict()
+                monthly["Own contribution paid"]=monthly["Month"].map(own_paid_by_month).fillna(0.0)
+                monthly["Loan contribution paid"]=monthly["Loan disbursed"]
+                monthly["Total property payment"]=monthly["Own contribution paid"]+monthly["Loan contribution paid"]
                 monthly["Protected cash added"]=monthly["Month"].apply(lambda m:monthly_buffer*(1+growth/100)**((m-1)//12))
                 monthly["Projected cash liquidity"]=min_liquidity+monthly["Protected cash added"].cumsum()
                 monthly["Liquidity surplus above minimum"]=monthly["Projected cash liquidity"]-min_liquidity
+                monthly["Closing own-contribution fund"]=monthly["Month"].map(closing_fund_by_month).fillna(0.0)
+                monthly["Closing cash balance"]=monthly["Projected cash liquidity"]+monthly["Closing own-contribution fund"]
                 monthly["Total payment this month"]=monthly["Scheduled EMI"]+monthly["Prepayment"]+monthly["Investment"]
                 monthly["Net worth indicator"]=monthly["Investment corpus"]+(loan-monthly["Loan outstanding"])
                 sheet_name=result.name[:31]
                 monthly.to_excel(writer,sheet_name=sheet_name,index=False,startrow=2)
                 ws=writer.book[sheet_name]
                 ws["A1"]=f"Monthly action plan — {result.name}"
-                ws["A2"]="Follow the Action column and update the calculator whenever income, expenses, loan rate or investment assumptions change."
+                ws["A2"]=f"{strategy_meanings[result.name]} Own contribution and loan contribution show property funding; closing cash balance excludes investment value."
             for ws in writer.book.worksheets:
                 ws.freeze_panes="A4"
                 ws.auto_filter.ref=f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
