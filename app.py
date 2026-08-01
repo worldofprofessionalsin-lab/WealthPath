@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="WealthPath", page_icon="🏠", layout="wide")
 st.markdown("""<style>
@@ -41,6 +43,8 @@ def simulate(name, loan, rate, tenure_m, payment, start_corpus, inv_r, invest_sh
     balance=loan; invested=start_corpus+(loan if leveraged else 0); cash=0.0; total_interest=0; rows=[]
     monthly_r=inv_r/12; loan_r=rate/1200; close_month=tenure_m
     for m in range(1,361):
+        opening_balance=balance
+        opening_investment=invested
         yearly_factor=(1+annual_growth/100)**((m-1)//12)
         capacity=payment*yearly_factor
         scheduled=emi(loan,rate,tenure_m) if balance>0 else 0
@@ -55,11 +59,22 @@ def simulate(name, loan, rate, tenure_m, payment, start_corpus, inv_r, invest_sh
         invest=capacity*invest_share
         if name=="Only EMI": cash+=capacity
         if balance<=0 and close_month==tenure_m: close_month=m
-        if balance<=0: invest += scheduled
+        emi_redirect=scheduled if balance<=0 else 0
+        if balance<=0: invest += emi_redirect
+        investment_growth=invested*monthly_r
         invested=invested*(1+monthly_r)+invest
         corpus=invested+cash
-        rows.append({"Month":m,"Loan outstanding":max(0,balance),"Investment corpus":corpus,
-                     "Interest":interest,"Prepayment":prepay,"Investment":invest})
+        if prepay>0 and invest>0: action="Pay EMI, prepay and invest"
+        elif prepay>0: action="Pay EMI and make prepayment"
+        elif invest>0: action="Pay EMI and invest"
+        elif scheduled>0: action="Pay regular EMI; retain surplus"
+        else: action="Loan closed; continue wealth building"
+        rows.append({"Month":m,"Action":action,"Opening loan balance":opening_balance,
+                     "Scheduled EMI":min(scheduled,opening_balance+interest),"Interest":interest,
+                     "Principal repaid":principal,"Prepayment":prepay,"Loan outstanding":max(0,balance),
+                     "Opening investment value":opening_investment,"Investment":invest,
+                     "Expected investment growth":investment_growth,"Investment corpus":corpus,
+                     "EMI redirected after closure":emi_redirect,"Monthly capacity":capacity})
     property_equity=max(0,loan-balance)
     risk=invest_share*8+(2 if leveraged else 0)
     return Result(name,total_interest,close_month,corpus,corpus+property_equity-balance,invest_share*10,risk,rows)
@@ -98,6 +113,7 @@ with t2:
     rate=c1.number_input("Current interest rate %",0.0,30.0,8.5,0.05,help="Monthly reducing-balance rate. Update this when a floating rate changes.")
     tenure_y=int(c2.number_input("Remaining tenure (years)",1,40,20))
     annual_prepay=c3.number_input("Optional annual lump sum",0.0,value=0.0,step=10000.0,help="Bonus or other amount available once each year, separate from monthly surplus.")
+    loan_start=st.date_input("Loan/report start date",value=date.today().replace(day=1),help="Used to convert Month 1, Month 2 and later actions into calendar months in the Excel report.")
     base_emi=emi(loan,rate,tenure_y*12)
     own_contribution=max(0,property_value+charges-loan)
     a,b=st.columns(2); a.metric("Calculated EMI",money(base_emi)); b.metric("Own contribution",money(own_contribution))
@@ -141,7 +157,67 @@ with t4:
     st.plotly_chart(fig,use_container_width=True)
     first=schedule.head(120).copy(); first["Date/action"]=first.Month.apply(lambda m:f"Month {m}")
     st.dataframe(first[["Date/action","Investment","Prepayment","Interest","Loan outstanding"]].style.format({c:money for c in ["Investment","Prepayment","Interest","Loan outstanding"]}),use_container_width=True)
-    st.download_button("Download strategy report (Excel)",data=(lambda b:(table.to_excel(b,index=False),b.seek(0),b.getvalue())[2])(io.BytesIO()),file_name="wealthpath_strategy_report.xlsx")
+    def build_excel_report():
+        output=io.BytesIO()
+        inputs=pd.DataFrame([
+            ["Selected objective",objective,"Controls which strategy is recommended"],
+            ["Recommended strategy",best.name,"Highest-ranked strategy for the selected objective"],
+            ["Monthly household income",total_income,"Salary plus spouse/other income"],
+            ["Monthly expenses",total_exp,"Total entered recurring expenses"],
+            ["Other monthly EMIs",existing_emi,"Debt repayments excluding this home loan"],
+            ["Safety buffer %",buffer_pct,"Protected portion of income"],
+            ["Calculated safe monthly surplus",safe_surplus,"Income − expenses − other EMIs − safety buffer"],
+            ["Property value",property_value,"Entered property price"],
+            ["Registration and other charges",charges,"Purchase costs outside property price"],
+            ["Home loan amount",loan,"Opening loan principal"],
+            ["Home loan interest rate %",rate,"Annual rate used on monthly reducing balance"],
+            ["Remaining tenure years",tenure_y,"Remaining contractual loan period"],
+            ["Calculated EMI",base_emi,"Monthly reducing-balance EMI"],
+            ["Expected post-tax investment return %",inv_r*100,"Weighted return after entered tax assumptions"],
+            ["Annual income growth %",growth,"Applied to future monthly capacity"],
+            ["Loan proceeds invested","Yes" if leveraged else "No","Normally No for a home loan"],
+        ],columns=["Input / output","Value","How it affects the plan"])
+        with pd.ExcelWriter(output,engine="openpyxl") as writer:
+            inputs.to_excel(writer,sheet_name="Inputs & Assumptions",index=False,startrow=2)
+            table.to_excel(writer,sheet_name="Strategy Comparison",index=False,startrow=2)
+            expenses.to_excel(writer,sheet_name="Expense Details",index=False,startrow=2)
+            assets.to_excel(writer,sheet_name="Asset Details",index=False,startrow=2)
+            investments.to_excel(writer,sheet_name="Investment Details",index=False,startrow=2)
+            for result in results:
+                monthly=pd.DataFrame(result.rows)
+                monthly.insert(1,"Calendar month",monthly["Month"].apply(lambda m:pd.Timestamp(loan_start)+pd.DateOffset(months=m-1)))
+                monthly["Total payment this month"]=monthly["Scheduled EMI"]+monthly["Prepayment"]+monthly["Investment"]
+                monthly["Net worth indicator"]=monthly["Investment corpus"]+(loan-monthly["Loan outstanding"])
+                sheet_name=result.name[:31]
+                monthly.to_excel(writer,sheet_name=sheet_name,index=False,startrow=2)
+                ws=writer.book[sheet_name]
+                ws["A1"]=f"Monthly action plan — {result.name}"
+                ws["A2"]="Follow the Action column and update the calculator whenever income, expenses, loan rate or investment assumptions change."
+            for ws in writer.book.worksheets:
+                ws.freeze_panes="A4"
+                ws.auto_filter.ref=f"A3:{get_column_letter(ws.max_column)}{ws.max_row}"
+                ws.sheet_view.showGridLines=False
+                if not ws["A1"].value: ws["A1"]=ws.title
+                ws["A1"].font=Font(bold=True,size=16,color="174B3A")
+                for cell in ws[3]:
+                    cell.font=Font(bold=True,color="FFFFFF")
+                    cell.fill=PatternFill("solid",fgColor="174B3A")
+                for column_cells in ws.columns:
+                    letter=column_cells[0].column_letter
+                    width=min(42,max(12,max(len(str(c.value or "")) for c in column_cells[:80])+2))
+                    ws.column_dimensions[letter].width=width
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if isinstance(cell.value,(int,float)) and any(k in str(ws.cell(3,cell.column).value or "").lower() for k in ["amount","income","expense","emi","interest","principal","balance","prepayment","investment","corpus","worth","value","payment","capacity"]):
+                            cell.number_format='₹#,##0.00;[Red]-₹#,##0.00'
+                if ws.title not in ["Inputs & Assumptions","Strategy Comparison","Expense Details","Asset Details","Investment Details"]:
+                    for cell in ws[4]:
+                        if cell.value=="Calendar month":
+                            for c in ws.iter_cols(min_col=cell.column,max_col=cell.column,min_row=4):
+                                for x in c: x.number_format="mmm yyyy"
+        output.seek(0)
+        return output.getvalue()
+    st.download_button("Download complete month-wise Excel report",data=build_excel_report(),file_name="wealthpath_month_wise_plan.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if run_mc:
         rng=np.random.default_rng(42); sims=10000
         returns=np.clip(rng.normal(inv_r,0.05,sims),-0.20,0.30)
