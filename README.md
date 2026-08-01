@@ -1,7 +1,24 @@
 # WealthPath Streamlit
 
-Version 4.1 fixes the one-time contribution schedule date mapping and safely
-accepts empty schedule tables without raising `KeyError: 'Date'`.
+Version 4.3 adds CSV import/templates and complete JSON backup/restore. It also
+includes the schedule and investment-editor validation fixes from versions 4.1
+and 4.2.
+
+## Data import and backup
+
+Open **Import, export or restore planner data** at the top of the app.
+
+- Download the CSV template, edit only the `Value` column, and import it back.
+- Export the current planner as CSV when bulk editing is useful.
+- Export JSON for a complete backup. Importing it later restores all entered
+  inputs, editable tables, dates, toggles, and the selected objective.
+- Calculated results are regenerated after import so they remain consistent
+  with the current calculation engine.
+
+Backups download to the device used to access Streamlit. Streamlit Community
+Cloud does not permanently store an individual user's planner data between
+browser sessions, so download the JSON backup before clearing the app or
+switching devices.
 
 ## Run locally
 
