@@ -107,6 +107,21 @@ DEFAULT_INVESTMENTS = pd.DataFrame({"Investment":["Equity mutual fund","Debt / F
 DATE_KEYS = {"loan_start"}
 TABLE_KEYS = {"expenses_data","property_schedule_data","assets_data","bonus_sources_data","investments_data"}
 
+def table_editor_key(table_key):
+    """Use disposable widget keys because data_editor state is read-only."""
+    revision=st.session_state.get("table_editor_revision",0)
+    return f"{table_key}_editor_{revision}"
+
+def stored_table(table_key,default):
+    """Return the imported/latest table without sharing its key with a widget."""
+    value=st.session_state.get(table_key,default)
+    return value.copy() if isinstance(value,pd.DataFrame) else pd.DataFrame(value)
+
+def remember_table(table_key,value):
+    """Persist editor output under a non-widget session-state key."""
+    st.session_state[table_key]=value.copy()
+    return value
+
 def json_safe(value):
     """Convert dates, numpy values and tables into portable JSON values."""
     if isinstance(value,pd.DataFrame):
@@ -154,6 +169,7 @@ def apply_import(payload):
     if payload.get("app") not in (None,"WealthPath"):
         raise ValueError("This file was not created for WealthPath.")
     inputs=payload["inputs"]
+    imported_tables={}
     for key,value in inputs.items():
         if key in TABLE_KEYS:
             if not isinstance(value,list):
@@ -161,7 +177,7 @@ def apply_import(payload):
             table=pd.DataFrame(value)
             if "Expected date" in table.columns:
                 table["Expected date"]=pd.to_datetime(table["Expected date"],errors="coerce").dt.date
-            st.session_state[key]=table
+            imported_tables[key]=table
         elif key in DATE_KEYS:
             parsed=pd.to_datetime(value,errors="coerce")
             if pd.isna(parsed):
@@ -169,6 +185,10 @@ def apply_import(payload):
             st.session_state[key]=parsed.date()
         else:
             st.session_state[key]=value
+    # data_editor widget state cannot be assigned through Session State. Store
+    # imported tables separately and use a new generation of widget keys.
+    st.session_state.update(imported_tables)
+    st.session_state["table_editor_revision"]=st.session_state.get("table_editor_revision",0)+1
 
 def template_values():
     start=date.today().replace(day=1)
@@ -347,7 +367,7 @@ with t1:
     salary=c1.number_input("Monthly in-hand income",0.0,value=120000.0,step=5000.0,key="salary",help="Household take-home income available before expenses and EMIs.")
     spouse=c2.number_input("Spouse/other monthly income",0.0,value=0.0,step=5000.0,key="spouse")
     growth=c3.number_input("Annual income growth %",0.0,30.0,6.0,0.5,key="growth",help="Raises future surplus; treated as an assumption, not guaranteed.")
-    expenses=st.data_editor(DEFAULT_EXPENSES,num_rows="dynamic",use_container_width=True,key="expenses_data")
+    expenses=remember_table("expenses_data",st.data_editor(stored_table("expenses_data",DEFAULT_EXPENSES),num_rows="dynamic",use_container_width=True,key=table_editor_key("expenses_data")))
     existing_emi=st.number_input("Other loan EMIs",0.0,value=0.0,step=1000.0,key="existing_emi")
     buffer_pct=st.slider("Safety buffer (% of income)",0,30,10,key="buffer_pct",help="Protected cash not allocated to investment or prepayment.")
     total_income=salary+spouse; total_exp=float(expenses["Monthly amount"].sum())
@@ -372,15 +392,16 @@ with t2:
     st.subheader("When will the property money be paid?")
     st.caption("Enter every expected tranche. The loan and your own money need not be paid on the first day.")
     d0=pd.Timestamp(loan_start)
-    property_schedule=st.data_editor(pd.DataFrame({
+    property_schedule_default=pd.DataFrame({
         "Payment / milestone":["Booking / initial payment","Construction / second payment","Registration / possession"],
         "Expected date":[d0.date(),(d0+pd.DateOffset(months=6)).date(),(d0+pd.DateOffset(months=12)).date()],
         "Own contribution":[own_contribution*.40,own_contribution*.30,own_contribution*.30],
-        "Loan disbursement":[loan*.20,loan*.40,loan*.40]}),num_rows="dynamic",use_container_width=True,key="property_schedule_data",
+        "Loan disbursement":[loan*.20,loan*.40,loan*.40]})
+    property_schedule=remember_table("property_schedule_data",st.data_editor(stored_table("property_schedule_data",property_schedule_default),num_rows="dynamic",use_container_width=True,key=table_editor_key("property_schedule_data"),
         column_config={
             "Expected date":st.column_config.DateColumn(help="Estimated date on which this tranche must reach the builder/seller."),
             "Own contribution":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="Money paid from savings—not borrowed money."),
-            "Loan disbursement":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="Loan amount expected from the bank on this date. Interest begins only after disbursement.")})
+            "Loan disbursement":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="Loan amount expected from the bank on this date. Interest begins only after disbursement.")}))
     entered_own=float(pd.to_numeric(property_schedule["Own contribution"],errors="coerce").fillna(0).sum())
     entered_loan=float(pd.to_numeric(property_schedule["Loan disbursement"],errors="coerce").fillna(0).sum())
     q1,q2=st.columns(2)
@@ -391,10 +412,10 @@ with t2:
 
 with t3:
     st.subheader("Existing assets")
-    assets=st.data_editor(DEFAULT_ASSETS,num_rows="dynamic",use_container_width=True,key="assets_data",
+    assets=remember_table("assets_data",st.data_editor(stored_table("assets_data",DEFAULT_ASSETS),num_rows="dynamic",use_container_width=True,key=table_editor_key("assets_data"),
         column_config={
             "Use for own contribution %":st.column_config.NumberColumn(min_value=0,max_value=100,help="The portion that can be sold or withdrawn to pay the property cost."),
-            "Keep invested in wealth plan %":st.column_config.NumberColumn(min_value=0,max_value=100,help="The portion that remains invested and forms the opening investment corpus.")})
+            "Keep invested in wealth plan %":st.column_config.NumberColumn(min_value=0,max_value=100,help="The portion that remains invested and forms the opening investment corpus.")}))
     asset_values=pd.to_numeric(assets["Current value"],errors="coerce").fillna(0)
     contribution_assets=float((asset_values*pd.to_numeric(assets["Use for own contribution %"],errors="coerce").fillna(0)/100).sum())
     usable_assets=float((asset_values*pd.to_numeric(assets["Keep invested in wealth plan %"],errors="coerce").fillna(0)/100).sum())
@@ -403,11 +424,12 @@ with t3:
     x,y=st.columns(2); x.metric("Assets available for own contribution",money(contribution_assets)); y.metric("Opening investment corpus",money(usable_assets))
     min_liquidity=st.number_input("Minimum cash liquidity to keep in hand",0.0,value=300000.0,step=25000.0,key="min_liquidity",
         help="Cash reserve that should remain untouched after every property payment and strategy action.")
-    bonus_sources=st.data_editor(pd.DataFrame({"Source":["Annual bonus / incentive"],"Expected date":[(pd.Timestamp(loan_start)+pd.DateOffset(months=5)).date()],"Amount":[0.0]}),num_rows="dynamic",use_container_width=True,key="bonus_sources_data",
-        column_config={"Expected date":st.column_config.DateColumn(),"Amount":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="A one-time inflow that can be used toward the property contribution.")})
+    bonus_sources_default=pd.DataFrame({"Source":["Annual bonus / incentive"],"Expected date":[(pd.Timestamp(loan_start)+pd.DateOffset(months=5)).date()],"Amount":[0.0]})
+    bonus_sources=remember_table("bonus_sources_data",st.data_editor(stored_table("bonus_sources_data",bonus_sources_default),num_rows="dynamic",use_container_width=True,key=table_editor_key("bonus_sources_data"),
+        column_config={"Expected date":st.column_config.DateColumn(),"Amount":st.column_config.NumberColumn(min_value=0,format="₹ %.0f",help="A one-time inflow that can be used toward the property contribution.")}))
     st.subheader("Investment assumptions")
     st.caption("Enter the actual holdings/options you want evaluated. Returns are projections, not guarantees.")
-    investments=st.data_editor(DEFAULT_INVESTMENTS,num_rows="dynamic",use_container_width=True,key="investments_data")
+    investments=remember_table("investments_data",st.data_editor(stored_table("investments_data",DEFAULT_INVESTMENTS),num_rows="dynamic",use_container_width=True,key=table_editor_key("investments_data")))
     inv_r=weighted_return(investments)
     st.metric("Weighted expected post-tax return",f"{inv_r*100:.2f}%")
 
